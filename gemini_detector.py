@@ -20,15 +20,20 @@ from google.genai import types
 
 MODEL_ID = "gemini-2.5-flash"
 
-# Prompt instructs Gemini to return normalized bounding boxes [ymin, xmin, ymax, xmax]
-# on a 0–1000 scale — same convention Gemini uses natively.
-_DETECTION_PROMPT = (
-    "Detect every distinct object visible in this image. "
-    "Return ONLY a JSON array — no markdown, no explanation, no extra text. "
-    "Each element: {\"label\": \"<object name>\", \"box\": [ymin, xmin, ymax, xmax]} "
-    "where all four coordinates are integers normalized to the range 0-1000. "
-    "Example: [{\"label\": \"bottle\", \"box\": [200, 150, 700, 450]}]"
-)
+
+def _build_prompt(target_class: str | None) -> str:
+    if target_class:
+        subject = f'only "{target_class}" objects (ignore everything else)'
+    else:
+        subject = "every distinct object visible in this image"
+    return (
+        f"Detect {subject}. "
+        "Return ONLY a JSON array — no markdown, no explanation, no extra text. "
+        "Each element: {\"label\": \"<object name>\", \"box\": [ymin, xmin, ymax, xmax]} "
+        "where all four coordinates are integers normalized to the range 0-1000. "
+        "Return an empty array [] if the object is not present. "
+        "Example: [{\"label\": \"bottle\", \"box\": [200, 150, 700, 450]}]"
+    )
 
 
 def _parse_gemini_response(text: str, frame_w: int, frame_h: int) -> list[dict]:
@@ -108,7 +113,8 @@ class GeminiDetector:
         stale = detector.is_stale(timeout=1.0)  # True if no response in >timeout seconds
     """
 
-    def __init__(self, api_key: str | None = None, model_id: str = MODEL_ID):
+    def __init__(self, api_key: str | None = None, model_id: str = MODEL_ID,
+                 target_class: str | None = None):
         key = api_key or os.environ.get("GOOGLE_API_KEY", "")
         if not key:
             raise ValueError(
@@ -117,10 +123,12 @@ class GeminiDetector:
             )
         self._client = genai.Client(api_key=key)
         self._model_id = model_id
+        self._target_class: str | None = target_class
 
         self._lock = threading.Lock()
         self._pending_frame = None
         self._pending_shape = None
+        self._pending_target: str | None = target_class
         self._latest_detections: list[dict] = []
         self._frame_event = threading.Event()
 
@@ -146,11 +154,22 @@ class GeminiDetector:
         self._running = False
         self._frame_event.set()
 
+    @property
+    def target_class(self) -> str | None:
+        with self._lock:
+            return self._target_class
+
+    @target_class.setter
+    def target_class(self, value: str | None):
+        with self._lock:
+            self._target_class = value
+
     def submit_frame(self, frame):
         """Queue a frame for Gemini inference (replaces any unprocessed frame)."""
         with self._lock:
             self._pending_frame = frame.copy()
             self._pending_shape = frame.shape
+            self._pending_target = self._target_class
         self._frame_event.set()
 
     def get_detections(self, target_class: str | None = None) -> list[dict]:
@@ -185,10 +204,12 @@ class GeminiDetector:
 
             frame = None
             shape = None
+            snap_target = None
             with self._lock:
                 if self._pending_frame is not None:
                     frame = self._pending_frame
                     shape = self._pending_shape
+                    snap_target = self._pending_target
                     self._pending_frame = None
                     self._pending_shape = None
 
@@ -196,12 +217,13 @@ class GeminiDetector:
                 continue
 
             h, w = shape[:2]
+            prompt = _build_prompt(snap_target)
             try:
                 img_bytes = self._encode(frame)
                 response = self._client.models.generate_content(
                     model=self._model_id,
                     contents=[
-                        _DETECTION_PROMPT,
+                        prompt,
                         types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
                     ],
                 )

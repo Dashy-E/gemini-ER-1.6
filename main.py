@@ -6,7 +6,8 @@ from PIL import Image, ImageTk
 from camera import get_frame, verify_resolution
 from gemini_detector import GeminiDetector
 from trajectory import TrajectoryTracker
-from visualization import draw_bounding_boxes, draw_trajectory, draw_hud, _color_for
+from visualization import draw_bounding_boxes, draw_trajectory, draw_hud, draw_approach_vector, _color_for
+from mapping import WORLD_SCALE
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
@@ -40,8 +41,11 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     verify_resolution(cap, FRAME_W, FRAME_H)
 
+    target_class = prompt_target()
+    log.info(f"Targeting: {target_class or 'ALL objects'}")
+
     # Gemini detector (background thread)
-    detector = GeminiDetector()
+    detector = GeminiDetector(target_class=target_class)
     detector.start()
     log.info(f"Detector started (model: {detector._model_id})")
 
@@ -52,8 +56,6 @@ def main():
         frame_h=FRAME_H,
     )
 
-    target_class = prompt_target()
-    log.info(f"Targeting: {target_class or 'ALL objects'}")
     log.info("Controls: q = quit | r = change target | c = clear trajectory")
 
     root = tk.Tk()
@@ -73,6 +75,7 @@ def main():
         elif ch == "r":
             new_target = prompt_target()
             nonlocal_target["value"] = new_target
+            detector.target_class = new_target
             tracker.clear()
             log.info(f"Targeting: {new_target or 'ALL objects'}")
         elif ch == "c":
@@ -122,6 +125,10 @@ def main():
         # Always draw boxes from whatever detections we have
         draw_bounding_boxes(frame, all_detections)
 
+        # Approach vector: camera base → target ground point
+        if primary:
+            draw_approach_vector(frame, primary, world_scale=WORLD_SCALE)
+
         world_pos = None
         velocity = (0.0, 0.0)
 
@@ -129,7 +136,9 @@ def main():
             primary_label = primary["label"]
             traj = tracker.get(primary_label)
             if traj:
-                draw_trajectory(frame, traj, color=_color_for(primary_label))
+                cam_origin = (FRAME_W // 2, FRAME_H - 1)
+                draw_trajectory(frame, traj, color=_color_for(primary_label),
+                                start_origin=cam_origin)
                 world_path = tracker.get_world_path(primary_label)
                 if world_path:
                     world_pos = world_path[0]
