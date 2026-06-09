@@ -6,17 +6,17 @@ The main thread calls submit_frame() to queue a frame and get_detections() to
 read the most recent results — both are non-blocking.
 
 Requires: GOOGLE_API_KEY environment variable (or pass api_key directly).
-Model default: gemini-2.0-flash  (change MODEL_ID to any vision-capable Gemini model)
+Model default: gemini-2.0-flash (swap to confirmed Gemini Robotics-ER 1.6 ID once available)
 """
 
 import os
 import cv2
 import json
-import base64
 import threading
 import time
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 MODEL_ID = "gemini-2.0-flash"
 
@@ -34,7 +34,6 @@ _DETECTION_PROMPT = (
 def _parse_gemini_response(text: str, frame_w: int, frame_h: int) -> list[dict]:
     """Parse Gemini JSON response into pixel-space detection dicts."""
     text = text.strip()
-    # Strip markdown code fences if present
     if "```" in text:
         parts = text.split("```")
         for part in parts:
@@ -68,13 +67,11 @@ def _parse_gemini_response(text: str, frame_w: int, frame_h: int) -> list[dict]:
         except (TypeError, ValueError):
             continue
 
-        # Clamp to valid range
         ymin = max(0, min(1000, ymin))
         xmin = max(0, min(1000, xmin))
         ymax = max(0, min(1000, ymax))
         xmax = max(0, min(1000, xmax))
 
-        # Convert normalized 0-1000 coords to pixel coords
         x1 = int(xmin * frame_w / 1000)
         y1 = int(ymin * frame_h / 1000)
         x2 = int(xmax * frame_w / 1000)
@@ -105,9 +102,10 @@ class GeminiDetector:
         detector.start()
 
         # In main loop:
-        detector.submit_frame(frame)        # non-blocking
-        dets = detector.get_detections()    # non-blocking, returns last result
-        fps  = detector.inference_fps       # approx Gemini inference rate
+        detector.submit_frame(frame)             # non-blocking
+        dets = detector.get_detections()         # non-blocking, returns last result
+        fps  = detector.inference_fps            # approx Gemini inference rate
+        stale = detector.is_stale(timeout=1.0)  # True if no response in >timeout seconds
     """
 
     def __init__(self, api_key: str | None = None, model_id: str = MODEL_ID):
@@ -117,11 +115,11 @@ class GeminiDetector:
                 "GOOGLE_API_KEY environment variable not set. "
                 "Export it before running: set GOOGLE_API_KEY=your_key"
             )
-        genai.configure(api_key=key)
-        self._model = genai.GenerativeModel(model_id)
+        self._client = genai.Client(api_key=key)
+        self._model_id = model_id
 
         self._lock = threading.Lock()
-        self._pending_frame = None          # frame waiting to be processed
+        self._pending_frame = None
         self._pending_shape = None
         self._latest_detections: list[dict] = []
         self._frame_event = threading.Event()
@@ -133,6 +131,7 @@ class GeminiDetector:
         self._last_fps_time = time.time()
         self.inference_fps = 0.0
         self.last_error: str = ""
+        self._last_seen: float = 0.0   # timestamp of last successful inference
 
     # ------------------------------------------------------------------
     # Public API
@@ -145,7 +144,7 @@ class GeminiDetector:
 
     def stop(self):
         self._running = False
-        self._frame_event.set()  # unblock waiting thread
+        self._frame_event.set()
 
     def submit_frame(self, frame):
         """Queue a frame for Gemini inference (replaces any unprocessed frame)."""
@@ -162,13 +161,22 @@ class GeminiDetector:
             dets = [d for d in dets if d["label"] == target_class.lower()]
         return dets
 
+    def is_stale(self, timeout: float = 1.0) -> bool:
+        """
+        Return True if Gemini has not produced a successful inference
+        within `timeout` seconds. Signals the robot controller that
+        position data should not be trusted for motion commands.
+        """
+        with self._lock:
+            last = self._last_seen
+        return last == 0.0 or (time.time() - last) > timeout
+
     # ------------------------------------------------------------------
     # Background thread
     # ------------------------------------------------------------------
 
     def _loop(self):
         while self._running:
-            # Block until a new frame is queued
             self._frame_event.wait()
             self._frame_event.clear()
 
@@ -189,34 +197,36 @@ class GeminiDetector:
 
             h, w = shape[:2]
             try:
-                b64 = self._encode(frame)
-                response = self._model.generate_content([
-                    _DETECTION_PROMPT,
-                    {"mime_type": "image/jpeg", "data": b64},
-                ])
+                img_bytes = self._encode(frame)
+                response = self._client.models.generate_content(
+                    model=self._model_id,
+                    contents=[
+                        _DETECTION_PROMPT,
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                    ],
+                )
                 dets = _parse_gemini_response(response.text, w, h)
+
+                now = time.time()
                 with self._lock:
                     self._latest_detections = dets
                     self.last_error = ""
-
-                # Track inference FPS
-                self._inference_count += 1
-                now = time.time()
-                elapsed = now - self._last_fps_time
-                if elapsed >= 2.0:
-                    self.inference_fps = self._inference_count / elapsed
-                    self._inference_count = 0
-                    self._last_fps_time = now
+                    self._last_seen = now
+                    self._inference_count += 1
+                    elapsed = now - self._last_fps_time
+                    if elapsed >= 2.0:
+                        self.inference_fps = self._inference_count / elapsed
+                        self._inference_count = 0
+                        self._last_fps_time = now
 
             except Exception as exc:
                 err = str(exc)
                 with self._lock:
                     self.last_error = err
-                print(f"[GeminiDetector] Error: {err}")
 
     @staticmethod
-    def _encode(frame) -> str:
-        """JPEG-encode a frame and return base64 string."""
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 75]
+    def _encode(frame) -> bytes:
+        """JPEG-encode a frame at high quality to preserve fine detail."""
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 90]
         _, buf = cv2.imencode(".jpg", frame, encode_params)
-        return base64.b64encode(buf).decode("utf-8")
+        return buf.tobytes()

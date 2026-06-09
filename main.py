@@ -1,15 +1,24 @@
 import cv2
-from camera import get_frame
+import logging
+import tkinter as tk
+import json
+from PIL import Image, ImageTk
+from camera import get_frame, verify_resolution
 from gemini_detector import GeminiDetector
 from trajectory import TrajectoryTracker
-from mapping import pixel_to_world
 from visualization import draw_bounding_boxes, draw_trajectory, draw_hud, _color_for
+from dotenv import load_dotenv
+load_dotenv(override=True)
 
-# ── Configuration ────────────────────────────────────────────────────────────
-TRAJECTORY_MAX_POINTS = 50   # how many centroid history points to keep
-# Gemini is called on every available frame from the background thread.
-# The main display loop always runs at full camera FPS.
-# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("gemini-er")
+
+FRAME_W = 640
+FRAME_H = 480
+TRAJECTORY_MAX_POINTS = 50
 
 
 def prompt_target():
@@ -24,97 +33,143 @@ def main():
     # Camera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("ERROR: Could not open camera.")
+        log.error("Could not open camera.")
         return
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    verify_resolution(cap, FRAME_W, FRAME_H)
 
     # Gemini detector (background thread)
     detector = GeminiDetector()
     detector.start()
-    print(f"[Gemini] Detector started (model: {detector._model.model_name})")
+    log.info(f"Detector started (model: {detector._model_id})")
 
-    # Trajectory tracker
-    tracker = TrajectoryTracker(max_points=TRAJECTORY_MAX_POINTS)
+    # Trajectory tracker — knows frame size for internal pixel→world mapping
+    tracker = TrajectoryTracker(
+        max_points=TRAJECTORY_MAX_POINTS,
+        frame_w=FRAME_W,
+        frame_h=FRAME_H,
+    )
 
-    # Target class
     target_class = prompt_target()
-    print(f"Targeting: {target_class or 'ALL objects'}")
-    print("Controls: q = quit | r = change target | c = clear trajectory")
+    log.info(f"Targeting: {target_class or 'ALL objects'}")
+    log.info("Controls: q = quit | r = change target | c = clear trajectory")
 
-    while True:
+    root = tk.Tk()
+    root.title("Robotic Manipulation System — Gemini Vision")
+    root.resizable(False, False)
+    label = tk.Label(root)
+    label.pack()
+
+    running = {"value": True}
+    nonlocal_target = {"value": target_class}
+
+    def on_key(event):
+        ch = event.char.lower()
+        if ch == "q":
+            running["value"] = False
+            root.destroy()
+        elif ch == "r":
+            new_target = prompt_target()
+            nonlocal_target["value"] = new_target
+            tracker.clear()
+            log.info(f"Targeting: {new_target or 'ALL objects'}")
+        elif ch == "c":
+            tracker.clear()
+            log.info("Trajectory cleared.")
+
+    root.bind("<Key>", on_key)
+
+    def update():
+        if not running["value"]:
+            return
+
+        target = nonlocal_target["value"]
+
         ret, frame = get_frame(cap)
         if not ret:
-            print("ERROR: Frame capture failed.")
-            break
+            log.error("Frame capture failed.")
+            running["value"] = False
+            root.destroy()
+            return
 
-        h, w = frame.shape[:2]
-
-        # ── Submit frame to Gemini (non-blocking) ──────────────────────────
-        # We always submit; the detector thread picks up the latest and drops
-        # any unprocessed frame — this keeps latency minimal.
         detector.submit_frame(frame)
 
-        # ── Retrieve latest detections ─────────────────────────────────────
+        # Guard: skip tracker update if Gemini data is stale (>1 s old)
+        if detector.is_stale(timeout=1.0):
+            log.warning("Gemini detections are stale — skipping tracker update.")
+        else:
+            all_detections = detector.get_detections()
+            target_detections = detector.get_detections(target)
+
+            primary = None
+            if target_detections:
+                primary = target_detections[0]
+            elif not target and all_detections:
+                primary = all_detections[0]
+
+            if primary:
+                tracker.update(primary["label"], primary["cx"], primary["cy"])
+
         all_detections = detector.get_detections()
-        target_detections = detector.get_detections(target_class)
-
-        # ── Update trajectory for the primary tracked object ───────────────
-        # If a target class is set, track that; otherwise track the first object.
-        primary_label = None
-        if target_detections:
-            primary = target_detections[0]
-            primary_label = primary["label"]
-            tracker.update(primary_label, primary["cx"], primary["cy"])
-        elif not target_class and all_detections:
-            primary = all_detections[0]
-            primary_label = primary["label"]
-            tracker.update(primary_label, primary["cx"], primary["cy"])
-
-        # ── Draw bounding boxes for ALL detections ─────────────────────────
         draw_bounding_boxes(frame, all_detections)
 
-        # ── Draw trajectory for primary tracked object ─────────────────────
-        if primary_label:
-            traj = tracker.get(primary_label)
-            traj_color = _color_for(primary_label)
-            draw_trajectory(frame, traj, color=traj_color)
+        primary_label = None
+        world_pos = None
+        velocity = (0.0, 0.0)
 
-            # Print trajectory to console (only when it changes)
-            if traj and len(traj) % 5 == 1:  # every 5 new points
-                print(f"\n[Trajectory for '{primary_label}'] (last {len(traj)} pts):")
-                import json
-                print(json.dumps(traj[:10], separators=(",", ":")))
+        if not detector.is_stale():
+            target_detections = detector.get_detections(target)
+            all_detections_now = detector.get_detections()
 
-            # Print world coordinates for the primary target
-            wx, wy = pixel_to_world(primary["cx"], primary["cy"], w, h)
-            if len(traj) % 5 == 1:
-                print(f"  World coords: ({wx:.3f}, {wy:.3f})")
+            primary = None
+            if target_detections:
+                primary = target_detections[0]
+            elif not target and all_detections_now:
+                primary = all_detections_now[0]
 
-        # ── HUD overlay ────────────────────────────────────────────────────
+            if primary:
+                primary_label = primary["label"]
+                traj = tracker.get(primary_label)
+                if traj:
+                    draw_trajectory(frame, traj, color=_color_for(primary_label))
+                    world_path = tracker.get_world_path(primary_label)
+                    if world_path:
+                        world_pos = world_path[0]
+                    velocity = tracker.get_velocity(primary_label)
+
+                    log.debug(
+                        f"[Trajectory '{primary_label}'] {len(traj)} pts | "
+                        f"world ({world_pos[0]:.3f}, {world_pos[1]:.3f}) m | "
+                        f"vel vx={velocity[0]:.3f} vy={velocity[1]:.3f} m/s\n"
+                        f"  path (last 5): "
+                        f"{json.dumps(tracker.get_world_path(primary_label)[:5], separators=(',', ':'))}"
+                    )
+
         draw_hud(
             frame,
-            target_class,
+            target,
             inference_fps=detector.inference_fps,
             num_detections=len(all_detections),
+            world_pos=world_pos,
+            velocity=velocity,
+            is_stale=detector.is_stale(),
             error=detector.last_error,
         )
 
-        cv2.imshow("Robotic Manipulation System — Gemini Vision", frame)
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        imgtk = ImageTk.PhotoImage(image=img)
+        label.imgtk = imgtk
+        label.configure(image=imgtk)
 
-        # ── Key handling ───────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("r"):
-            cv2.destroyAllWindows()
-            target_class = prompt_target()
-            print(f"Targeting: {target_class or 'ALL objects'}")
-        elif key == ord("c"):
-            tracker.clear()
-            print("[Trajectory] Cleared.")
+        root.after(1, update)
+
+    root.after(0, update)
+    root.mainloop()
 
     detector.stop()
     cap.release()
-    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
