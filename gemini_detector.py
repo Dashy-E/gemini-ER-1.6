@@ -6,7 +6,7 @@ The main thread calls submit_frame() to queue a frame and get_detections() to
 read the most recent results — both are non-blocking.
 
 Requires: GOOGLE_API_KEY environment variable (or pass api_key directly).
-Model default: gemini-2.0-flash (swap to confirmed Gemini Robotics-ER 1.6 ID once available)
+Model default: gemini-2.5-flash (swap to confirmed Gemini Robotics-ER 1.6 ID once available)
 """
 
 import os
@@ -18,7 +18,7 @@ import time
 from google import genai
 from google.genai import types
 
-MODEL_ID = "gemini-2.0-flash"
+MODEL_ID = "gemini-2.5-flash"
 
 # Prompt instructs Gemini to return normalized bounding boxes [ymin, xmin, ymax, xmax]
 # on a 0–1000 scale — same convention Gemini uses natively.
@@ -223,6 +223,8 @@ class GeminiDetector:
                 err = str(exc)
                 with self._lock:
                     self.last_error = err
+                import logging
+                logging.getLogger("gemini-er").error(f"[GeminiDetector] {err}")
 
     @staticmethod
     def _encode(frame) -> bytes:

@@ -81,6 +81,8 @@ def main():
 
     root.bind("<Key>", on_key)
 
+    stale_logged = {"value": False}   # suppress repeated stale warnings
+
     def update():
         if not running["value"]:
             return
@@ -96,56 +98,48 @@ def main():
 
         detector.submit_frame(frame)
 
-        # Guard: skip tracker update if Gemini data is stale (>1 s old)
-        if detector.is_stale(timeout=1.0):
-            log.warning("Gemini detections are stale — skipping tracker update.")
-        else:
-            all_detections = detector.get_detections()
-            target_detections = detector.get_detections(target)
-
-            primary = None
-            if target_detections:
-                primary = target_detections[0]
-            elif not target and all_detections:
-                primary = all_detections[0]
-
-            if primary:
-                tracker.update(primary["label"], primary["cx"], primary["cy"])
+        # Stale threshold: 3 s gives Gemini time to respond under normal API load
+        stale = detector.is_stale(timeout=3.0)
 
         all_detections = detector.get_detections()
+        target_detections = detector.get_detections(target)
+
+        # Determine primary object
+        primary = None
+        if target_detections:
+            primary = target_detections[0]
+        elif not target and all_detections:
+            primary = all_detections[0]
+
+        # Update tracker only when detections are fresh
+        if not stale and primary:
+            tracker.update(primary["label"], primary["cx"], primary["cy"])
+            stale_logged["value"] = False
+        elif stale and not stale_logged["value"]:
+            log.warning("Gemini detections are stale — tracker paused.")
+            stale_logged["value"] = True
+
+        # Always draw boxes from whatever detections we have
         draw_bounding_boxes(frame, all_detections)
 
-        primary_label = None
         world_pos = None
         velocity = (0.0, 0.0)
 
-        if not detector.is_stale():
-            target_detections = detector.get_detections(target)
-            all_detections_now = detector.get_detections()
+        if primary:
+            primary_label = primary["label"]
+            traj = tracker.get(primary_label)
+            if traj:
+                draw_trajectory(frame, traj, color=_color_for(primary_label))
+                world_path = tracker.get_world_path(primary_label)
+                if world_path:
+                    world_pos = world_path[0]
+                velocity = tracker.get_velocity(primary_label)
 
-            primary = None
-            if target_detections:
-                primary = target_detections[0]
-            elif not target and all_detections_now:
-                primary = all_detections_now[0]
-
-            if primary:
-                primary_label = primary["label"]
-                traj = tracker.get(primary_label)
-                if traj:
-                    draw_trajectory(frame, traj, color=_color_for(primary_label))
-                    world_path = tracker.get_world_path(primary_label)
-                    if world_path:
-                        world_pos = world_path[0]
-                    velocity = tracker.get_velocity(primary_label)
-
-                    log.debug(
-                        f"[Trajectory '{primary_label}'] {len(traj)} pts | "
-                        f"world ({world_pos[0]:.3f}, {world_pos[1]:.3f}) m | "
-                        f"vel vx={velocity[0]:.3f} vy={velocity[1]:.3f} m/s\n"
-                        f"  path (last 5): "
-                        f"{json.dumps(tracker.get_world_path(primary_label)[:5], separators=(',', ':'))}"
-                    )
+                log.debug(
+                    f"['{primary_label}'] {len(traj)} pts | "
+                    f"world ({world_pos[0]:.3f}, {world_pos[1]:.3f}) m | "
+                    f"vel vx={velocity[0]:.3f} vy={velocity[1]:.3f} m/s"
+                )
 
         draw_hud(
             frame,
@@ -154,7 +148,7 @@ def main():
             num_detections=len(all_detections),
             world_pos=world_pos,
             velocity=velocity,
-            is_stale=detector.is_stale(),
+            is_stale=stale,
             error=detector.last_error,
         )
 
